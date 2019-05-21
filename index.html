@@ -1,0 +1,308 @@
+<!doctype html>
+
+<html>
+<head>
+    <title>Hello WEB RTC</title>
+    <style>
+        video{
+            width: 400px;
+        }
+    </style>
+</head>
+<body>
+    <section>
+        <h1>Hello WEB RTC</h1>
+        <video id="localVideo" autoplay></video>
+        <video id="remoteVideo" autoplay></video>
+        <button id="call">call</button>
+        <button id="hangout">houngout</button>
+    </section>
+</body>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+    'use strict';
+
+    //연결에 필요한 객체들
+
+    var pc;
+    var localRTCPeer = new RTCPeerConnection();
+    var remoteRTCPeer = new RTCPeerConnection();
+    var myRoom = 'firstRoom';
+
+    var localStream;
+    var remoteStream;
+
+    //연결상태를 나타내는 플래그들
+    var isInitiator = false; //현재 세션이 카메라를 연결하고, 서버에 방 생성 또는 방에 조인을 한경우 true
+    var isChannelReady = false; //채팅방에 개설자와 참석자가 모두 들어온 경우, true;
+    var isStarted = false; //RTCPeerConnection 시작 확인 플래그
+
+    var turnReady;
+
+    //socket io open
+    var socket = io.connect();
+
+    //내 비디오 연결준비하기
+
+    var localVideo = document.querySelector('video#localVideo');
+    var remoteVideo = document.querySelector('video#remoteVideo');
+
+
+    var pcConfig = {
+        'iceServers': [{'urls':'stun:stun.l.google.com:19302'}]
+    };
+
+    var sdpConstraints = {
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true
+    };
+
+
+    ////////////////
+    //연결 준비하기.
+    //채팅방에 입장하는 과정임.
+    if(myRoom !== ''){
+        socket.emit('create or join', myRoom);
+        console.log('send create of join : ' +myRoom );
+    }
+
+
+    //로컬 미디어와 video 태그 연결
+    navigator.mediaDevices.getUserMedia({video: true, audio: false})
+        .then((stream)=>{
+
+            localStream = stream;
+
+            localVideo.srcObject = stream;
+
+            console.log('send user got media message');
+            socket.emit('message', 'user got media');
+
+            if(isInitiator){
+                console.log('preConnection Start Call it');
+                preConnectionStart();
+            }
+
+
+        }).catch((err)=>{
+            console.log('getUserMedia() error:'+err);
+    });
+
+
+
+    //버튼 이벤트
+    var callBtn = document.querySelector('button#call');
+    var hangoutBtn = document.querySelector('button#hangout');
+
+    callBtn.addEventListener('click', function(event){
+        console.log('callBtn click');
+    });
+
+    hangoutBtn.addEventListener('click', function(event){
+        console.log('hangoutBtn click');
+    });
+
+
+    function createPeerConnection(){
+        try{
+            pc = new RTCPeerConnection(null);
+            pc.onicecandidate = handleIceCandidate;
+            pc.onaddstream = handleRemoteStreamAdded;
+            pc.onremovestream = handleRemoteStreamRemoved;
+
+            console.log('Created RTCPeerConnection');
+
+        }catch(e){
+
+            console.log('Failed to create PeerConnection, exception' + e.message);
+            alert('Cannot create RTCPeerConnection object.');
+            return;
+        }
+    }
+
+    function preConnectionStart(){
+        console.log('preConnectionStrat() ', isStarted, localStream, isChannelReady);
+
+        if(!isStarted && typeof localStream !== 'undefined' && isChannelReady){
+            console.log('create peer connection');
+            createPeerConnection();
+
+            pc.addStream(localStream);
+
+            isStarted = true;
+
+            console.log('isInitioator', isInitiator);
+            if(isInitiator){
+                doCall();
+                console.log('##do Call 이후 createPeerConnection()에 등록된 이벤트들이 실행되는지 체크함');
+            }
+        }
+
+    }
+
+
+
+    function handleIceCandidate(event){
+        console.log('ice candidate event', event);
+
+        if(event.candidate){
+
+            socket.emit('message', {
+                type: 'candidate',
+                label: event.candidate.sdpMLineIndex,
+                id: event.candidate.sdpMid,
+                candidate: event.candidate.candidate}
+                );
+
+        }else{
+            console.log('End of candidate');
+        }
+    };
+
+    function handleCreateOfferError(event) {
+        console.log('createOffer() error: ', event);
+    };
+
+
+    function doCall(){
+        console.log('Sending offer to peer');
+        pc.createOffer(setLocalAndSendMessage, handleCreateOfferError);
+    }
+
+    function doAnswer(){
+        console.log('Sending answer to peer');
+        pc.createAnswer().then(
+          setLocalAndSendMessage,
+          onCreateSessionDescriptionError
+        );
+    }
+
+    function setLocalAndSendMessage(sessionDescription) {
+        pc.setLocalDescription(sessionDescription);
+        console.log('setLocalAndSendMessage sending message', sessionDescription);
+        socket.emit('message',sessionDescription);
+    }
+
+    function onCreateSessionDescriptionError(error) {
+        console.log('Failed to create session description: ' + error.toString());
+    }
+
+
+    //원격 접속을 위한 TURN 요청
+    function requestTurn(turnURL) {
+        var turnExists = false;
+        for (var i in pcConfig.iceServers) {
+            if (pcConfig.iceServers[i].urls.substr(0, 5) === 'turn:') {
+                turnExists = true;
+                turnReady = true;
+                break;
+            }
+        }
+        //옵션에 등록되어 있지 않으면, 가져와서 등록 이벤트 작성
+        if (!turnExists) {
+            console.log('Getting TURN server from ', turnURL);
+            // No TURN server. Get one from computeengineondemand.appspot.com:
+            var xhr = new XMLHttpRequest();
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState === 4 && xhr.status === 200) {
+                    var turnServer = JSON.parse(xhr.responseText);
+                    console.log('Got TURN server: ', turnServer);
+                    pcConfig.iceServers.push({
+                        'urls': 'turn:' + turnServer.username + '@' + turnServer.turn,
+                        'credential': turnServer.password
+                    });
+                    turnReady = true;
+                }
+            };
+            xhr.open('GET', turnURL, true);
+            xhr.send();
+        }
+    }
+
+    function handleRemoteStreamAdded(event){
+        console.log('Remote stream added');
+        remoteStream = event.stream;
+        remoteVideo.srcObject = event.stream;
+
+    };
+
+    function handleRemoteStreamRemoved(event){
+        console.log('Remote Stream removed. Event: ', event);
+    };
+
+    function hangup(){
+        console.log('hangig up');
+        stop();
+        socket.emit('message', 'bye');
+    }
+
+    function handleRemoteHangup() {
+        console.log('Session terminated.');
+        stop();
+        isInitiator = false;
+    }
+
+    function stop() {
+        isStarted = false;
+        pc.close();
+        pc = null;
+    }
+
+
+
+    //사용자가 채팅방에 들어와서 RTCPeerConnection할 준비가 되었는지 체크하는 이벤트들
+    socket.on('created', function(msg){
+        isInitiator = true;
+        console.log('receive created : ' + msg+ " : isInitiator : "+isInitiator);
+    });
+
+    socket.on('joined', function(msg){
+        isChannelReady = true;
+        console.log('receive joined : ' + msg+ " : isInitiator : "+isInitiator);
+    });
+
+    socket.on('join', function(msg){
+        isChannelReady = true;
+        console.log('receive join : ' + msg + " : isChannelReady : "+isChannelReady);
+    });
+
+    socket.on('message', function(msg){
+        console.log('received message from server : '+msg);
+
+        if(msg === 'user got media'){
+            console.log('#USER GOT MEDIA CALL ? MESSAGE -> '+msg);
+            preConnectionStart();
+        }else if(msg.type === 'offer'){
+            if(!isInitiator && !isStarted){
+                console.log("");
+                preConnectionStart();
+            }
+            console.log('##Check pc');
+            console.log(pc);
+
+            pc.setRemoteDescription(new RTCSessionDescription(msg));
+
+            doAnswer();
+
+        }else if(msg.type === 'answer' && isStarted){
+            //isStarted는 채팅방 입장 완료후 preConnectionStart()가 호출 되었으면 true임
+            //즉 현재 세션의 연결을 시작했고 상대방으로부터 답장을 받은 상황
+            console.log('RECEIVED ANSWER ');
+            console.log(msg);
+            pc.setRemoteDescription(new RTCSessionDescription(msg));
+
+        }else if(msg.type === 'candidate' && isStarted){
+            var candidate = new RTCIceCandidate({
+                sdpMLineIndex: msg.label,
+                candidate: msg.candidate
+            });
+            pc.addIceCandidate(candidate);
+        }else if(msg === 'bye' && isStarted){
+            handleRemoteHangup();
+        }
+
+    });
+
+</script>
+</html>
